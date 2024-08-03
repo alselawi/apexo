@@ -61,8 +61,8 @@ class Observable<D extends Doc> {
     timerRef = t;
   }
 
-  _cc(List<D> input) {
-    return [...input].sort(_comparator);
+  List<D> _cc(List<D> input) {
+    return [...input]..sort(_comparator);
   }
 
   int _comparator(D a, D b) => a.id.compareTo(b.id);
