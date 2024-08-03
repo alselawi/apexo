@@ -67,17 +67,17 @@ class Observable<D extends Doc> {
 
   int _comparator(D a, D b) => a.id.compareTo(b.id);
 
-  observe(Callback callback) {
+  String observe(Callback callback) {
     var observer = Observer(callback);
     listeners.add(observer);
     return observer.id;
   }
 
-  unObserve(String id) {
+  void unObserve(String id) {
     listeners.removeWhere((item) => item.id == id);
   }
 
-  stop() {
+  void stop() {
     listeners.clear();
     timerRef.cancel();
   }
