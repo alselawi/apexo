@@ -7,7 +7,7 @@ class _ServerResponse {
   late String output;
   _ServerResponse(String source) {
     try {
-      var decoded = jsonDecode(source);
+      dynamic decoded = jsonDecode(source);
       success = decoded["success"];
       output = decoded["output"];
     } catch (_) {
@@ -24,10 +24,10 @@ class _Row {
   _Row(this.id, this.data, this.ts);
 }
 
-class _VersionedResult {
+class VersionedResult {
   int version;
   List<_Row> rows;
-  _VersionedResult(this.version, this.rows);
+  VersionedResult(this.version, this.rows);
 }
 
 class SaveRemote {
@@ -37,8 +37,7 @@ class SaveRemote {
 
   bool isOnline = true;
 
-  SaveRemote(
-      {required this.baseUrl, required this.token, required this.table}) {
+  SaveRemote({required this.baseUrl, required this.token, required this.table}) {
     checkOnline();
   }
 
@@ -47,11 +46,13 @@ class SaveRemote {
       final response = await http.head(Uri.parse(baseUrl));
       if (response.statusCode != 200) {
         isOnline = false;
+        retryConnection();
       } else {
         isOnline = true;
       }
     } catch (id) {
       isOnline = false;
+      retryConnection();
     }
   }
 
@@ -65,7 +66,7 @@ class SaveRemote {
     });
   }
 
-  Future<_VersionedResult> getSince({int version = 0}) async {
+  Future<VersionedResult> getSince({int version = 0}) async {
     int page = 0;
     bool nextPage = true;
     int fetchedVersion = 0;
@@ -84,24 +85,24 @@ class SaveRemote {
             .body);
       } catch (e) {
         checkOnline();
-        return _VersionedResult(0, []);
+        return VersionedResult(0, []);
       }
 
       if (!response.success) {
-        return _VersionedResult(0, []);
+        return VersionedResult(0, []);
       }
 
       final output = jsonDecode(response.output) as Map<String, dynamic>;
       List rows = output['rows'];
-      nextPage = rows.isNotEmpty && version != 0;
+      nextPage = rows.isNotEmpty;
       fetchedVersion = output['version'];
-      var formattedRows =
-          rows.map((row) => _Row(row["id"], row["data"], row["ts"]));
+      Iterable<_Row> formattedRows =
+          rows.map((row) => _Row(row["id"], row["data"], (row["ts"] != null) ? int.parse(row["ts"]) : null));
       result.addAll(formattedRows);
       page += 1;
     }
 
-    return _VersionedResult(fetchedVersion, result);
+    return VersionedResult(fetchedVersion, result);
   }
 
   Future<int> getVersion() async {
@@ -128,19 +129,40 @@ class SaveRemote {
     }
   }
 
-  Future<void> put(Map<String, String> data) async {
+  Future<bool> put(Map<String, String> data) async {
     final String url = '$baseUrl/$table';
     try {
-      await http.put(
+      var x = _ServerResponse((await http.put(
         Uri.parse(url),
         headers: {
           'Authorization': 'Bearer $token',
         },
         body: jsonEncode(data),
-      );
+      ))
+          .body);
+      if (x.success == false) throw x.output;
     } catch (e) {
       checkOnline();
       throw e;
     }
+    return true;
+  }
+
+  Future<bool> clear() async {
+    final String url = '$baseUrl/$table';
+    try {
+      var x = _ServerResponse((await http.delete(
+        Uri.parse(url),
+        headers: {
+          'Authorization': 'Bearer $token',
+        },
+      ))
+          .body);
+      if (x.success == false) throw x.output;
+    } catch (e) {
+      checkOnline();
+      throw e;
+    }
+    return true;
   }
 }

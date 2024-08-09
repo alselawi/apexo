@@ -1,10 +1,10 @@
 import 'uuid.dart';
 
-class Doc {
+class Model {
   String id = uuid();
   bool? archived;
 
-  Doc.fromJson(Map<String, dynamic> json) {
+  Model.fromJson(Map<String, dynamic> json) {
     id = json["id"] ?? uuid();
     archived = json["archived"];
   }

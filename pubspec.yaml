@@ -1,10 +1,9 @@
-name: my_dart_project
-description: A new Dart project.
+name: apexo
+description: apexo.app written in dart
 version: 1.0.0
-
+repository: https://github.com/alselawi/apexo.git
 environment:
   sdk: '>=2.15.0 <3.0.0'
-
 dependencies:
   hive: ^2.2.3
   http: ^1.2.2

@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
-import 'model.dart';
-import 'observable.dart';
-import 'save.local.dart';
-import 'save.remote.dart';
+import 'Model.dart';
+import 'ObservableList.dart';
+import 'SaveLocal.dart';
+import 'SaveRemote.dart';
+import 'Debouncer.dart';
 
 typedef ModellingFunc<G> = G Function(Map<String, dynamic> input);
 
@@ -14,19 +14,22 @@ class SyncResult {
   int? conflicts;
   String? exception;
   SyncResult({this.pushed, this.pulled, this.conflicts, this.exception});
+  toString() {
+    return "pushed: $pushed, pulled: $pulled, conflicts: $conflicts, exception: $exception";
+  }
 }
 
-class Store<G extends Doc> {
+class Store<G extends Model> {
   late Future<void> loaded;
   final Function? onSyncStart;
   final Function? onSyncEnd;
-  final Observable<G> observableObject;
+  final ObservableList<G> observableObject;
   final Set<String> changes = Set();
   final SaveLocal local;
   final SaveRemote remote;
   final int debounceMS;
+  late Debouncer _debouncer;
   late ModellingFunc<G> modeling;
-
   bool deferredPresent = false;
   int lastProcessChanges = 0;
 
@@ -37,29 +40,33 @@ class Store<G extends Doc> {
       this.debounceMS = 100,
       this.onSyncStart,
       this.onSyncEnd})
-      : observableObject = Observable([], debounceMS) {
+      : observableObject = ObservableList() {
+    // setting up debouncer
+    _debouncer = Debouncer(
+      milliseconds: debounceMS,
+    );
+
     // loading from local
     loaded = _loadFromLocal();
 
     // setting up observers
-    observableObject.observe((ids) {
+    observableObject.observe((events) {
+      List<String> ids = events.map((e) => e.id).toList();
       changes.addAll(ids);
-      int nextRun = lastProcessChanges +
-          debounceMS -
-          DateTime.now().millisecondsSinceEpoch;
-      Timer(Duration(milliseconds: max(nextRun, 0)), () {
+      _debouncer.run(() {
         _processChanges();
       });
     });
   }
 
   Future<void> _loadFromLocal() async {
-    var all = await local.getAll();
-    var modeled = all.map((x) => modeling(_deSerialize(x)));
+    Iterable<String> all = await local.getAll();
+    Iterable<G> modeled = all.map((x) => modeling(_deSerialize(x)));
 
-    observableObject.silent = true;
-    observableObject.target.clear();
-    observableObject.target.addAll(modeled);
+    observableObject.silently(() {
+      observableObject.clear();
+      observableObject.addAll(modeled.toList());
+    });
     return;
   }
 
@@ -73,7 +80,7 @@ class Store<G extends Doc> {
 
   _processChanges() async {
     if (changes.length == 0) return;
-    onSyncStart!();
+    onSyncStart?.call();
     lastProcessChanges = DateTime.now().millisecondsSinceEpoch;
 
     Map<String, String> toWrite = {};
@@ -81,7 +88,7 @@ class Store<G extends Doc> {
     List<String> changesToProcess = [...changes.toList()];
 
     for (String element in changesToProcess) {
-      G item = observableObject.target.firstWhere((x) => x.id == element);
+      G item = observableObject.firstWhere((x) => x.id == element);
       String serialized = _serialize(item);
       toWrite[element] = serialized;
       toDefer[element] = lastProcessChanges;
@@ -90,11 +97,11 @@ class Store<G extends Doc> {
     await local.put(toWrite);
     Map<String, int> lastDeferred = await local.getDeferred();
 
-    if (remote.isOnline && lastDeferred.length > 0) {
+    if (remote.isOnline && lastDeferred.length == 0) {
       try {
         await remote.put(toWrite);
         changes.clear();
-        onSyncEnd!();
+        onSyncEnd?.call();
         return;
       } catch (e) {
         print("Will defer updates, due to error during sending.");
@@ -103,26 +110,26 @@ class Store<G extends Doc> {
     }
 
     /**
-     * If we reached here, it means that its either
-     * 1. we're offline
-     * 2. there was an error during sending updates
-     * 3. there are already deferred updates
-     */
+	 * If we reached here, it means that its either
+	 * 1. we're offline
+	 * 2. there was an error during sending updates
+	 * 3. there are already deferred updates
+	 */
     await local.putDeferred({}
       ..addAll(lastDeferred)
       ..addAll(toDefer));
     deferredPresent = true;
     changes.clear();
-    onSyncEnd!();
+    onSyncEnd?.call();
   }
 
-  _syncTry() async {
-    if (remote.isOnline == false)
-      return SyncResult(exception: "remote server is offline");
+  Future<SyncResult> _syncTry() async {
+    if (remote.isOnline == false) return SyncResult(exception: "remote server is offline");
     try {
       int localVersion = await local.getVersion();
       int remoteVersion = await remote.getVersion();
-      var deferred = await local.getDeferred();
+
+      Map<String, int> deferred = await local.getDeferred();
       int conflicts = 0;
 
       if (localVersion == remoteVersion && deferred.length == 0) {
@@ -130,20 +137,24 @@ class Store<G extends Doc> {
       }
 
       // fetch updates since our local version
-      var remoteUpdates = await remote.getSince(version: localVersion);
+      VersionedResult remoteUpdates = await remote.getSince(version: localVersion);
+
+      List<int> remoteLosersIndices = [];
 
       // check conflicts: last write wins
       deferred.removeWhere((dfID, dfTS) {
-        int remoteConflictIndex =
-            remoteUpdates.rows.indexWhere((r) => r.id == dfID);
-        int remoteTS =
-            remoteUpdates.rows[remoteConflictIndex].ts ?? remoteVersion;
+        int remoteConflictIndex = remoteUpdates.rows.indexWhere((r) => r.id == dfID);
+        if (remoteConflictIndex == -1) {
+          return false;
+        }
+        int remoteTS = remoteUpdates.rows[remoteConflictIndex].ts ?? remoteVersion;
         if (remoteConflictIndex == -1) {
           // no conflicts
           return false;
         } else if (dfTS > remoteTS) {
           // local update wins
           conflicts++;
+          remoteLosersIndices.add(remoteConflictIndex);
           return false;
         } else {
           // remote update wins
@@ -153,15 +164,18 @@ class Store<G extends Doc> {
         }
       });
 
-      Map<String, String> toLocalWrite = Map.fromEntries(
-          remoteUpdates.rows.map((r) => MapEntry(r.id, r.data)));
+      // remove losers from remote updates
+      remoteLosersIndices.forEach((index) {
+        remoteUpdates.rows.removeAt(index);
+      });
 
-      Map<String, String> toRemoteWrite = Map.fromEntries(await Future.wait(
-          deferred.entries.map((entry) async =>
-              MapEntry(entry.key, await local.get(entry.key)))));
+      Map<String, String> toLocalWrite = Map.fromEntries(remoteUpdates.rows.map((r) => MapEntry(r.id, r.data)));
 
-      await local.put(toLocalWrite);
-      await remote.put(toRemoteWrite);
+      Map<String, String> toRemoteWrite = Map.fromEntries(
+          await Future.wait(deferred.entries.map((entry) async => MapEntry(entry.key, await local.get(entry.key)))));
+
+      if (toLocalWrite.length > 0) await local.put(toLocalWrite);
+      if (toRemoteWrite.length > 0) await remote.put(toRemoteWrite);
 
       // reset deferred
       await local.putDeferred({});
@@ -183,86 +197,105 @@ class Store<G extends Doc> {
 
       await _loadFromLocal();
       return SyncResult(
-          pulled: toLocalWrite.length,
-          pushed: toRemoteWrite.length,
-          conflicts: conflicts,
-          exception: null);
-    } catch (e) {
+          pulled: toLocalWrite.length, pushed: toRemoteWrite.length, conflicts: conflicts, exception: null);
+    } catch (e, stacktrace) {
+      print("Error during synchronization: $e");
+      print(stacktrace);
       return SyncResult(exception: e.toString());
     }
   }
 
   //// ----------------------------- Public API --------------------------------
 
+  /// Syncs the local database with the remote database
   Future<List<SyncResult>> synchronize() async {
     lastProcessChanges = DateTime.now().millisecondsSinceEpoch;
-    onSyncStart!();
+    onSyncStart?.call();
     List<SyncResult> tries = [];
     while (true) {
-      var result = await _syncTry();
+      SyncResult result = await _syncTry();
       tries.add(result);
       if (result.exception != null) break;
     }
-    onSyncEnd!();
+    onSyncEnd?.call();
     return tries;
   }
 
+  //// Returns true if the local database is in sync with the remote database
   Future<bool> inSync() async {
     if (deferredPresent) return false;
     return await local.getVersion() == await remote.getVersion();
   }
 
+  /// Reloads the store from the local database
   Future<void> reload() async {
     await _loadFromLocal();
   }
 
-  get list {
-    return observableObject.target;
+  /// Returns a list of all the documents in the local database
+  List<G> get docs {
+    return [...observableObject.docs];
   }
 
-  get copy {
-    return [...observableObject.target];
+  /// gets a document by id
+  G get(String id) {
+    return docs.firstWhere((x) => x.id == id);
   }
 
-  get(String id) {
-    return observableObject.target.firstWhere((x) => x.id == id);
+  /// gets a document index by id
+  int getIndex(String id) {
+    return docs.indexWhere((x) => x.id == id);
   }
 
-  getIndex(String id) {
-    return observableObject.target.indexWhere((x) => x.id == id);
+  /// adds a document
+  void add(G item) {
+    observableObject.add(item);
   }
 
-  add(G item) {
-    observableObject.target.add(item);
+  /// adds a list of documents
+  void addAll(List<G> items) {
+    observableObject.addAll(items);
   }
 
-  archive(String id) {
-    var index = getIndex(id);
+  /// modifies a document
+  void modify(G item) {
+    observableObject.modify(item);
+  }
+
+  /// archives a document by id (the concept of deletion is not supported here)
+  void archive(String id) {
+    int index = getIndex(id);
     if (index == -1) return;
-    observableObject.target[index].archived = true;
+    observableObject.modify(docs[index]..archived = true);
   }
 
-  unarchive(String id) {
-    var index = getIndex(id);
+  /// un-archives a document by id (the concept of deletion is not supported here)
+  void unarchive(String id) {
+    int index = getIndex(id);
     if (index == -1) return;
-    observableObject.target[index].archived = false;
+    observableObject.modify(docs[index]..archived = false);
   }
 
-  delete(String id) {
+  /// archives a document by id (the concept of deletion is not supported here)
+  void delete(String id) {
     archive(id);
   }
 
+  /// returns a dump that can be used to restore the store to a specific state
   Future<Dump> backup() async {
     return await local.dump();
   }
 
-  restore(Dump dump) async {
+  /// restores the store to a specific state using a dump
+  Future<void> restore(Dump dump) async {
     await remote.checkOnline();
     if (remote.isOnline == false) {
-      return throw Exception("remote server is offline");
+      throw Exception("remote server is offline");
     }
-    await local.restore(dump);
+    await local.clear();
+    await remote.clear();
     await remote.put(dump.main);
-    await synchronize(); // to get the latest version
+    await synchronize();
+    await _loadFromLocal();
   }
 }
